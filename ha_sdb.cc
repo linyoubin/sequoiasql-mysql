@@ -64,6 +64,10 @@ using namespace sdbclient;
   "Plugin: " SDB_PLUGIN_VERSION ", Driver: " SDB_DRIVER_VERSION \
   ", BuildTime: " __DATE__ " " __TIME__
 
+#ifndef FLG_INSERT_REPLACEONDUP
+#define FLG_INSERT_REPLACEONDUP 0x00000004
+#endif
+
 #define SDB_OID_LEN 12
 #define SDB_OID_FIELD "_id"
 #define SDB_FIELD_MAX_LEN (16 * 1024 * 1024)
@@ -171,6 +175,8 @@ ha_sdb::ha_sdb(handlerton *hton, TABLE_SHARE *table_arg)
   first_read = true;
   count_times = 0;
   last_count_time = time(NULL);
+  m_ignore_dup_key = false;
+  m_write_can_replace = false;
   m_use_bulk_insert = false;
   stats.records = 0;
   memset(db_name, 0, SDB_CS_NAME_MAX_SIZE + 1);
@@ -325,6 +331,9 @@ int ha_sdb::reset() {
   free_root(&blobroot, MYF(0));
   m_lock_type = TL_IGNORE;
   pushed_condition = SDB_EMPTY_BSON;
+  m_ignore_dup_key = false;
+  m_write_can_replace = false;
+  m_use_bulk_insert = false;
   return 0;
 }
 
@@ -684,12 +693,17 @@ void ha_sdb::start_bulk_insert(ha_rows rows) {
   m_use_bulk_insert = true;
 }
 
-int ha_sdb::flush_bulk_insert(bool ignore_dup_key) {
+int ha_sdb::flush_bulk_insert() {
   DBUG_ASSERT(m_bulk_insert_rows.size() > 0);
   DBUG_ASSERT(NULL != collection);
   DBUG_ASSERT(collection->thread_id() == ha_thd()->thread_id());
 
-  int flag = ignore_dup_key ? FLG_INSERT_CONTONDUP : 0;
+  int flag = 0;
+  if (m_write_can_replace) {
+    flag = FLG_INSERT_REPLACEONDUP;
+  } else if (m_ignore_dup_key) {
+    flag = FLG_INSERT_CONTONDUP;
+  }
 
   int rc = collection->bulk_insert(flag, m_bulk_insert_rows);
   if (rc != 0) {
@@ -709,8 +723,7 @@ int ha_sdb::end_bulk_insert() {
   if (m_use_bulk_insert) {
     m_use_bulk_insert = false;
     if (m_bulk_insert_rows.size() > 0) {
-      bool ignore_dup_key = ha_thd()->lex && ha_thd()->lex->is_ignore();
-      rc = flush_bulk_insert(ignore_dup_key);
+      rc = flush_bulk_insert();
     }
   }
 
@@ -721,7 +734,6 @@ int ha_sdb::write_row(uchar *buf) {
   int rc = 0;
   bson::BSONObj obj;
   bson::BSONObj tmp_obj;
-  bool ignore_dup_key = ha_thd()->lex && ha_thd()->lex->is_ignore();
 
   ha_statistic_increment(&SSV::ha_write_count);
 
@@ -736,7 +748,7 @@ int ha_sdb::write_row(uchar *buf) {
   if (m_use_bulk_insert) {
     m_bulk_insert_rows.push_back(obj);
     if ((int)m_bulk_insert_rows.size() >= sdb_bulk_insert_size) {
-      rc = flush_bulk_insert(ignore_dup_key);
+      rc = flush_bulk_insert();
       if (rc != 0) {
         goto error;
       }
@@ -748,7 +760,12 @@ int ha_sdb::write_row(uchar *buf) {
     // temporarily use bulk_insert() instead, this should be revised when driver
     // add new method in new version.
     std::vector<bson::BSONObj> row(1, obj);
-    int flag = ignore_dup_key ? FLG_INSERT_CONTONDUP : 0;
+    int flag = 0;
+    if (m_write_can_replace) {
+      flag = FLG_INSERT_REPLACEONDUP;
+    } else if (m_ignore_dup_key) {
+      flag = FLG_INSERT_CONTONDUP;
+    }
     rc = collection->bulk_insert(flag, row);
     if (rc != 0) {
       if (SDB_IXM_DUP_KEY == get_sdb_code(rc)) {
@@ -781,7 +798,7 @@ int ha_sdb::update_row(const uchar *old_data, uchar *new_data) {
 
   rc = get_update_obj(old_data, new_data, new_obj, null_obj);
   if (rc != 0) {
-    if (HA_ERR_UNKNOWN_CHARSET == rc && ha_thd()->lex->is_ignore()) {
+    if (HA_ERR_UNKNOWN_CHARSET == rc && m_ignore_dup_key) {
       rc = 0;
     } else {
       goto error;
@@ -1446,7 +1463,23 @@ error:
 }
 
 int ha_sdb::extra(enum ha_extra_function operation) {
-  // TODO: extra hints
+  switch (operation) {
+    case HA_EXTRA_IGNORE_DUP_KEY: /* Dup keys don't rollback everything*/
+      m_ignore_dup_key = true;
+      break;
+    case HA_EXTRA_NO_IGNORE_DUP_KEY:
+      m_ignore_dup_key = false;
+      break;
+    case HA_EXTRA_WRITE_CAN_REPLACE:
+      m_write_can_replace = true;
+      break;
+    case HA_EXTRA_WRITE_CANNOT_REPLACE:
+      m_write_can_replace = false;
+      break;
+    default:
+      break;
+  }
+
   return 0;
 }
 

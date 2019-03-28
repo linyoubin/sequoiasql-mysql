@@ -298,7 +298,7 @@ class ha_sdb : public handler {
 
   int cur_row(uchar *buf);
 
-  int flush_bulk_insert(bool ignore_dup_key);
+  int flush_bulk_insert();
 
   int create_index(Sdb_cl &cl, Alter_inplace_info *ha_alter_info,
                    Bitmap<MAX_INDEXES> &ignored_keys);
@@ -335,6 +335,8 @@ class ha_sdb : public handler {
   int count_times;
   MEM_ROOT blobroot;
   int idx_order_direction;
+  bool m_ignore_dup_key;
+  bool m_write_can_replace;
   bool m_use_bulk_insert;
   std::vector<bson::BSONObj> m_bulk_insert_rows;
   Sdb_obj_cache<bson::BSONElement> m_bson_element_cache;
